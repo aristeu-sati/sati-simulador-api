@@ -16,8 +16,8 @@ import requests
 # =========================================================
 
 # Seus links públicos (CSV)
-FIN_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ONyZQvlJTIYSmHX4fGZTtH5j3N5yalMjrGMfPsyrEbE/gviz/tq?tqx=out:csv&gid=0"
-INS_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ONyZQvlJTIYSmHX4fGZTtH5j3N5yalMjrGMfPsyrEbE/gviz/tq?tqx=out:csv&gid=1836407575"
+FIN_URL_DEFAULT = ""  # set via env FIN_URL
+INS_URL_DEFAULT = ""  # set via env INS_URL
 
 # TTL (segundos) - pode configurar no Render: CONFIG_TTL_SECONDS=300, por exemplo
 CONFIG_TTL_SECONDS = int(os.getenv("CONFIG_TTL_SECONDS", "300"))
@@ -472,7 +472,11 @@ def list_operations() -> Dict[str, Any]:
 
 @app.post("/simulate/potential")
 def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
-    load_configs()  # usa cache TTL
+    try:
+        load_configs()  # usa cache TTL
+    except Exception as e:
+        # erro típico: FIN_URL/INS_URL não configuradas ou falha ao baixar CSV do Google Sheets
+        raise HTTPException(status_code=503, detail=f"Falha ao carregar configurações (FIN_URL/INS_URL): {e}")
 
     if _fin_df is None:
         raise HTTPException(status_code=500, detail="Config de financiamento não carregada")
@@ -591,3 +595,7 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
         "summary_text": summary_text,   # <-- sempre preenchido (texto leigo)
         "results": results,
     }
+
+    # valida URLs (evita defaults inválidos)
+    if not FIN_URL or not INS_URL:
+        raise RuntimeError("FIN_URL/INS_URL não configuradas. Defina as variáveis de ambiente FIN_URL e INS_URL (links CSV gviz do Google Sheets).")
