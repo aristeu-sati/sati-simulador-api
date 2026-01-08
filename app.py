@@ -256,15 +256,28 @@ def build_whatsapp_text(operation: str, bank: str, price: Optional[dict], sac: O
     lines.append("Quer que eu simule em outros bancos também?")
     return "\n".join(lines).strip()
 
-def get_insurance_rates(bank: str, age: int) -> Dict[str, float]:
+from typing import Optional
+
+def get_insurance_rates(bank: str, age: int) -> Optional[Dict[str, float]]:
     load_configs()  # respeita TTL
     if _ins_df is None:
-        raise HTTPException(status_code=500, detail="Configs de seguros não carregadas")
+        return None
 
     age_c = clamp_age(age)
     df = _ins_df[_ins_df["banco"].str.lower() == bank.strip().lower()]
     if df.empty:
-        raise HTTPException(status_code=422, detail=f"Banco sem seguros_export: {bank}")
+        return None
+
+    row = df[df["idade"] == age_c]
+    if row.empty:
+        # fallback: pega idade mais próxima <=, senão a menor disponível
+        df2 = df.sort_values("idade")
+        candidates = df2[df2["idade"] <= age_c]
+        row = candidates.iloc[[-1]] if not candidates.empty else df2.iloc[[0]]
+
+    r = row.iloc[0]
+    return {"dfi_rate": float(r["dfi_rate"]), "mip_rate": float(r["mip_rate"])}
+
 
     row = df[df["idade"] == age_c]
     if row.empty:
