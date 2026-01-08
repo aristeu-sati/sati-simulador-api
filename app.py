@@ -16,8 +16,8 @@ import requests
 # =========================================================
 
 # Seus links públicos (CSV)
-FIN_URL_DEFAULT = ""  # set via env FIN_URL
-INS_URL_DEFAULT = ""  # set via env INS_URL
+FIN_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ONyZQvlJTIYSmHX4fGZTtH5j3N5yalMjrGMfPsyrEbE/gviz/tq?tqx=out:csv&gid=0"
+INS_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ONyZQvlJTIYSmHX4fGZTtH5j3N5yalMjrGMfPsyrEbE/gviz/tq?tqx=out:csv&gid=1836407575"
 
 # TTL (segundos) - pode configurar no Render: CONFIG_TTL_SECONDS=300, por exemplo
 CONFIG_TTL_SECONDS = int(os.getenv("CONFIG_TTL_SECONDS", "300"))
@@ -184,6 +184,29 @@ def parse_brl_money(s: Any) -> Optional[float]:
         return None
 
 
+def parse_float_any(v: Any) -> float:
+    """Converte números vindos de CSV/planilha (pt-BR ou en-US) para float.
+    Aceita exemplos:
+      - "0,000055"  -> 0.000055
+      - "1.234,56"  -> 1234.56
+      - "1234.56"   -> 1234.56
+      - 0.3 / 1 / 10
+    """
+    if v is None:
+        return float("nan")
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if s == "" or s.lower() == "nan":
+        return float("nan")
+    # Remove espaços
+    s = s.replace(" ", "")
+    # Se tiver vírgula, assume pt-BR (milhar com ponto e decimal com vírgula)
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    return float(s)
+
+
 def is_min_installment_field(s: Any) -> bool:
     if s is None:
         return False
@@ -218,7 +241,7 @@ def get_insurance_rates(bank: str, age: int) -> Optional[Dict[str, float]]:
         row = candidates.iloc[[-1]] if not candidates.empty else df2.iloc[[0]]
 
     r = row.iloc[0]
-    return {"dfi_rate": float(r["dfi_rate"]), "mip_rate": float(r["mip_rate"])}
+    return {"dfi_rate": parse_float_any(r["dfi_rate"]), "mip_rate": parse_float_any(r["mip_rate"])}
 
 
 # =========================================================
@@ -472,11 +495,7 @@ def list_operations() -> Dict[str, Any]:
 
 @app.post("/simulate/potential")
 def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
-    try:
-        load_configs()  # usa cache TTL
-    except Exception as e:
-        # erro típico: FIN_URL/INS_URL não configuradas ou falha ao baixar CSV do Google Sheets
-        raise HTTPException(status_code=503, detail=f"Falha ao carregar configurações (FIN_URL/INS_URL): {e}")
+    load_configs()  # usa cache TTL
 
     if _fin_df is None:
         raise HTTPException(status_code=500, detail="Config de financiamento não carregada")
@@ -516,10 +535,10 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
                 "message": f"Banco sem seguros_export: {bank}",
             }
         else:
-            quota = float(row["quota"])
-            term = int(float(row["prazo máximo (meses)"]))
-            annual_rate = float(row["taxa efetiva (a.a.)"])
-            commitment = float(row["comprometimento de renda"])
+            quota = parse_float_any(row["quota"])
+            term = int(parse_float_any(row["prazo máximo (meses)"]))
+            annual_rate = parse_float_any(row["taxa efetiva (a.a.)"])
+            commitment = parse_float_any(row["comprometimento de renda"])
             min_value_field = row.get("valor mínimo", None)
 
             sim = simulate_potential_row(
@@ -595,7 +614,3 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
         "summary_text": summary_text,   # <-- sempre preenchido (texto leigo)
         "results": results,
     }
-
-    # valida URLs (evita defaults inválidos)
-    if not FIN_URL or not INS_URL:
-        raise RuntimeError("FIN_URL/INS_URL não configuradas. Defina as variáveis de ambiente FIN_URL e INS_URL (links CSV gviz do Google Sheets).")
