@@ -529,19 +529,28 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
         commitment = float(row["comprometimento de renda"])
         min_value_field = row.get("valor mínimo", None)
 
-        ins = get_insurance_rates(bank, age)
+ins = get_insurance_rates(bank, age)
 
-        sim = simulate_potential_row(
-            amortization=amortization,
-            quota=quota,
-            term_months=term,
-            annual_rate=annual_rate,
-            commitment_rate=commitment,
-            income=req.monthly_income,
-            dfi_rate=ins["dfi_rate"],
-            mip_rate=ins["mip_rate"],
-            min_value_field=min_value_field,
-        )
+if ins is None:
+    sim = {
+        "ok": False,
+        "fits": False,
+        "error": "missing_insurance",
+        "message": f"Banco sem seguros_export: {bank}"
+    }
+else:
+    sim = simulate_potential_row(
+        amortization=amortization,
+        quota=quota,
+        term_months=term,
+        annual_rate=annual_rate,
+        commitment_rate=commitment,
+        income=req.monthly_income,
+        dfi_rate=ins["dfi_rate"],
+        mip_rate=ins["mip_rate"],
+        min_value_field=min_value_field,
+    )
+
 
         if bank not in results_by_bank:
             results_by_bank[bank] = {"bank": bank, "PRICE": None, "SAC": None}
