@@ -26,6 +26,11 @@ _fin_df: Optional[pd.DataFrame] = None
 _ins_df: Optional[pd.DataFrame] = None
 _last_load_ts: float = 0.0
 
+
+# =========================================================
+# Helpers de normalização
+# =========================================================
+
 def _norm_col(c: str) -> str:
     # normaliza cabeçalho: tira espaços, lower
     return str(c).strip().lower()
@@ -40,7 +45,7 @@ def _to_bool(x) -> bool:
     return s in {"true", "verdadeiro", "1", "sim", "yes", "y"}
 
 def _to_float(x):
-    """Converte número vindo como '0.123' ou '0,123'."""
+    """Converte número vindo como '0.123' ou '0,123' ou '1.234,56'."""
     if x is None:
         return None
     if isinstance(x, (int, float)):
@@ -48,7 +53,7 @@ def _to_float(x):
     s = str(x).strip()
     if s == "":
         return None
-    # tenta lidar com formatos 1.234,56 e 1234,56
+    # tenta lidar com formatos 1.234,56
     if s.count(",") == 1 and s.count(".") >= 1:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -65,6 +70,11 @@ def _extract_age_from_label(label: Any) -> Optional[int]:
     m = re.search(r"(\d+)\s*$", str(label).strip())
     return int(m.group(1)) if m else None
 
+
+# =========================================================
+# Loader de configs com TTL
+# =========================================================
+
 def load_configs(force: bool = False) -> None:
     """Carrega as configs do Google Sheets. Usa cache por TTL."""
     global _fin_df, _ins_df, _last_load_ts
@@ -80,7 +90,7 @@ def load_configs(force: bool = False) -> None:
     except Exception as e:
         raise RuntimeError(f"Falha ao carregar configs do Google Sheets CSV: {e}")
 
-    # Normaliza nomes das colunas (lower + strip), mas mantém um mapa para acessar
+    # Normaliza nomes das colunas (lower + strip)
     fin = fin_raw.copy()
     fin.columns = [_norm_col(c) for c in fin.columns]
 
@@ -90,8 +100,6 @@ def load_configs(force: bool = False) -> None:
     # ---------------------------
     # FINANCIAMENTO (colunas mínimas)
     # ---------------------------
-    # Aceita variações comuns: "amortização" pode vir com ou sem acento etc.
-    # Aqui assumimos que sua aba está igual a que você já usa.
     required_fin = [
         "banco",
         "operação",
@@ -123,22 +131,16 @@ def load_configs(force: bool = False) -> None:
 
     # ---------------------------
     # SEGUROS_EXPORT (aceita seu formato atual)
+    # Esperado (no mínimo): banco, dfi_rate, mip_rate, idade (ou mip_label para extrair)
+    # Pode ter extras: seguradora, mip_label etc.
     # ---------------------------
-    # Seu CSV tem: ativo, banco, seguradora, dfi_rate, mip_label, mip_rate, idade
-    # Aqui aceitamos:
-    # - banco (obrigatório)
-    # - dfi_rate (obrigatório)
-    # - mip_rate (obrigatório)
-    # - idade (obrigatório, mas se não existir, tentamos extrair do mip_label)
-    if "banco" not in ins.columns and "Banco".lower() not in ins.columns:
-        # já normalizamos; então checamos "banco"
+    if "banco" not in ins.columns:
         raise RuntimeError("Coluna obrigatória faltando em Seguros_export: Banco")
 
     # Ativo pode ser "ativo"
     if "ativo" in ins.columns:
         ins = ins[ins["ativo"].apply(_to_bool)].copy()
 
-    # Garante as colunas numéricas
     if "dfi_rate" not in ins.columns:
         raise RuntimeError("Coluna obrigatória faltando em Seguros_export: dfi_rate")
     if "mip_rate" not in ins.columns:
@@ -165,13 +167,16 @@ def load_configs(force: bool = False) -> None:
 
 @app.on_event("startup")
 def _startup():
+    # Se der erro aqui, o Render mostra o motivo no log
     load_configs(force=True)
+
 
 # =========================================================
 # Utils
 # =========================================================
 
 def annual_to_monthly(annual_rate: float) -> float:
+    # taxa efetiva anual -> efetiva mensal
     return pow(1.0 + annual_rate, 1.0 / 12.0) - 1.0
 
 def calc_age(birth_date_iso: str) -> int:
@@ -196,6 +201,11 @@ def price_factor(i_m: float, n: int) -> float:
 _money_re = re.compile(r"R\$\s*([\d\.\,]+)")
 
 def parse_brl_money(s: Any) -> Optional[float]:
+    """
+    Aceita:
+      - "R$ 200,00 (de Parcela)"
+      - "R$750.000,00"
+    """
     if s is None:
         return None
     if isinstance(s, (int, float)):
@@ -215,8 +225,39 @@ def is_min_installment_field(s: Any) -> bool:
         return False
     return "parcela" in str(s).lower()
 
+def brl(x: float) -> str:
+    s = f"{x:,.2f}"
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {s}"
+
+def build_whatsapp_text(operation: str, bank: str, price: Optional[dict], sac: Optional[dict]) -> str:
+    lines = [f"📌 Simulação ({operation}) — {bank}\n"]
+
+    if price and price.get("fits"):
+        lines += [
+            "✅ Opção com MENOR entrada (PRICE)",
+            f"• Imóvel até: {brl(price['property_value'])}",
+            f"• Entrada aprox.: {brl(price['down_payment'])}",
+            f"• Financiamento: {brl(price['pv_financing'])}",
+            f"• Parcela inicial estimada: {brl(price['month1_installment'])}",
+            ""
+        ]
+
+    if sac and sac.get("fits"):
+        lines += [
+            "🚀 Opção com MAIOR potencial (SAC)",
+            f"• Imóvel até: {brl(sac['property_value'])}",
+            f"• Entrada aprox.: {brl(sac['down_payment'])}",
+            f"• Financiamento: {brl(sac['pv_financing'])}",
+            f"• Parcela inicial estimada: {brl(sac['month1_installment'])}",
+            ""
+        ]
+
+    lines.append("Quer que eu simule em outros bancos também?")
+    return "\n".join(lines).strip()
+
 def get_insurance_rates(bank: str, age: int) -> Dict[str, float]:
-    load_configs()
+    load_configs()  # respeita TTL
     if _ins_df is None:
         raise HTTPException(status_code=500, detail="Configs de seguros não carregadas")
 
@@ -227,12 +268,14 @@ def get_insurance_rates(bank: str, age: int) -> Dict[str, float]:
 
     row = df[df["idade"] == age_c]
     if row.empty:
+        # fallback: pega idade mais próxima <=, senão a menor disponível
         df2 = df.sort_values("idade")
         candidates = df2[df2["idade"] <= age_c]
         row = candidates.iloc[[-1]] if not candidates.empty else df2.iloc[[0]]
 
     r = row.iloc[0]
     return {"dfi_rate": float(r["dfi_rate"]), "mip_rate": float(r["mip_rate"])}
+
 
 # =========================================================
 # Endpoints básicos
@@ -254,8 +297,9 @@ def list_banks() -> Dict[str, Any]:
     banks = sorted(_fin_df["banco"].dropna().unique().tolist())
     return {"ok": True, "banks": banks}
 
+
 # =========================================================
-# SAC (mantive os endpoints)
+# SAC (simulação e fit)
 # =========================================================
 
 class SacRequest(BaseModel):
@@ -351,6 +395,7 @@ def fit_sac(req: SacFitRequest) -> Dict[str, Any]:
         "pv_allowed": round(pv_allowed, 2),
     }
 
+
 # =========================================================
 # POTENCIAL
 # =========================================================
@@ -360,6 +405,7 @@ class PotentialRequest(BaseModel):
     birth_date: str = Field(..., description="YYYY-MM-DD")
     operation: str
     banks: Optional[List[str]] = None
+
 
 def simulate_potential_row(
     amortization: str,  # "SAC" ou "PRICE"
@@ -375,6 +421,7 @@ def simulate_potential_row(
     i_m = annual_to_monthly(annual_rate)
     max_installment = income * commitment_rate
 
+    # DFI depende do valor do imóvel = PV/quota  => DFI = (PV/quota)*dfi_rate = PV*(dfi_rate/quota)
     dfi_per_pv = dfi_rate / quota
 
     if amortization == "SAC":
@@ -405,19 +452,25 @@ def simulate_potential_row(
     property_value = pv_allowed / quota
     down_payment = property_value - pv_allowed
 
+    # Regra de mínimo (se existir)
     min_ok = True
+    min_reason = None
     min_money = parse_brl_money(min_value_field)
     if min_money is not None:
         if is_min_installment_field(min_value_field):
             if installment < min_money:
                 min_ok = False
+                min_reason = f"installment<{min_money}"
         else:
             if property_value < min_money:
                 min_ok = False
+                min_reason = f"property_value<{min_money}"
 
     return {
         "ok": True,
         "fits": pv_allowed > 0 and min_ok,
+        "min_rule_ok": min_ok,
+        "min_rule_reason": min_reason,
         "quota": round(quota, 4),
         "term_months": int(term_months),
         "annual_rate": float(annual_rate),
@@ -435,9 +488,10 @@ def simulate_potential_row(
         }
     }
 
+
 @app.post("/simulate/potential")
 def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
-    load_configs()
+    load_configs()  # usa cache TTL
 
     age = calc_age(req.birth_date)
 
@@ -478,8 +532,62 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
 
         if bank not in results_by_bank:
             results_by_bank[bank] = {"bank": bank, "PRICE": None, "SAC": None}
+
+        # Se tiver duplicidade no sheet, mantém o último (ou você pode criar regra aqui)
         results_by_bank[bank][amortization] = sim
 
     results = list(results_by_bank.values())
 
-    return {"ok": True, "age": age, "operation": req.operation, "results": results}
+    # -----------------------------------------------------
+    # SUMMARY: melhor potencial (maior property_value) e menor entrada
+    # -----------------------------------------------------
+    best_property = None
+    lowest_entry = None
+
+    for item in results:
+        bank = item["bank"]
+        for sys in ("PRICE", "SAC"):
+            r = item.get(sys)
+            if not r or not r.get("fits"):
+                continue
+
+            if best_property is None or r["property_value"] > best_property["property_value"]:
+                best_property = {
+                    "bank": bank,
+                    "system": sys,
+                    "property_value": r["property_value"],
+                    "pv_financing": r["pv_financing"],
+                    "down_payment": r["down_payment"],
+                    "month1_installment": r["month1_installment"],
+                }
+
+            if lowest_entry is None or r["down_payment"] < lowest_entry["down_payment"]:
+                lowest_entry = {
+                    "bank": bank,
+                    "system": sys,
+                    "property_value": r["property_value"],
+                    "pv_financing": r["pv_financing"],
+                    "down_payment": r["down_payment"],
+                    "month1_installment": r["month1_installment"],
+                }
+
+    # -----------------------------------------------------
+    # WhatsApp text (se tiver 1 banco, já fica perfeito)
+    # Se tiver vários bancos, você pode montar no Make usando o "summary"
+    # -----------------------------------------------------
+    whatsapp_text = None
+    if len(results) == 1:
+        b = results[0]
+        whatsapp_text = build_whatsapp_text(req.operation, b["bank"], b.get("PRICE"), b.get("SAC"))
+
+    return {
+        "ok": True,
+        "age": age,
+        "operation": req.operation,
+        "summary": {
+            "best_property_value": best_property,
+            "lowest_down_payment": lowest_entry,
+        },
+        "whatsapp_text": whatsapp_text,
+        "results": results,
+    }
