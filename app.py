@@ -235,6 +235,7 @@ def simulate_potential_row(
     dfi_rate: float,
     mip_rate: float,
     min_value_field: Any,
+    bank: str | None = None,
 ) -> Dict[str, Any]:
     """
     Retorna o maior PV (financiamento) possível que caiba na renda,
@@ -283,23 +284,38 @@ def simulate_potential_row(
         mip = pv_allowed * mip_rate
         dfi = (pv_allowed / quota) * dfi_rate
         installment = payment_no_insurance + mip + dfi
-
-    # ---- MIX (implementação simples/intermediária)
-    # fator MIX = média entre "SAC sem seguros" e "PRICE sem seguros"
+    # ---- MIX (Itaú) — conforme documentação:
+    #  - Meses 1..36: "PRICE base" (PMT do prazo total) com amortização acelerada (1.2x)
+    #  - Mês 37+: vira SAC (não calculado aqui; aqui fazemos o potencial com base na 1ª parcela)
     elif amortization == "MIX":
-        k_price = price_factor(i_m, term_months)
-        k_sac = (1.0 / term_months) + i_m
-        k_mix = (k_price + k_sac) / 2.0
+        # Regra de elegibilidade (documentação: MIX apenas Itaú). Se bank não for informado, apenas calcula.
+        if bank is not None:
+            b = (bank or "").strip().lower()
+            if ("itau" not in b) and ("itaú" not in b):
+                return {
+                    "ok": False,
+                    "fits": False,
+                    "error": "mix_only_itau",
+                    "message": "Sistema MIX é exclusivo do banco Itaú (conforme documentação).",
+                }
 
-        A = k_mix + mip_rate + dfi_per_pv
+        k_price = price_factor(i_m, term_months)  # PMT base (sem seguros) = PV * k_price
+        # 1ª parcela (sem seguros), com amortização acelerada:
+        #   payment_base = PV*k_price
+        #   interest1 = PV*i_m
+        #   amort1 = (payment_base - interest1) * 1.2
+        #   installment_no_insurance1 = interest1 + amort1 = PV*(1.2*k_price - 0.2*i_m)
+        k_mix_month1 = (1.2 * k_price) - (0.2 * i_m)
+
+        A = k_mix_month1 + mip_rate + dfi_per_pv
         pv_allowed = max_installment / A if A > 0 else 0.0
 
-        payment_no_insurance = pv_allowed * k_mix
+        payment_base = pv_allowed * k_price
         interest = pv_allowed * i_m
-        amort = payment_no_insurance - interest
+        amort = (payment_base - interest) * 1.2
         mip = pv_allowed * mip_rate
         dfi = (pv_allowed / quota) * dfi_rate
-        installment = payment_no_insurance + mip + dfi
+        installment = (interest + amort) + mip + dfi
 
     else:
         return {
@@ -512,6 +528,7 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
                 dfi_rate=ins["dfi_rate"],
                 mip_rate=ins["mip_rate"],
                 min_value_field=min_value_field,
+                bank=bank,
             )
 
         # mantém o último caso tenha duplicidade
