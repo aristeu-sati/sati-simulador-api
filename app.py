@@ -2,182 +2,137 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from math import pow
 from datetime import date
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import time
 import os
 import re
 
 import pandas as pd
+import requests
 
-app = FastAPI(title="Sati Simulador API")
 
 # =========================================================
 # CONFIG (Google Sheets CSV + TTL cache)
 # =========================================================
 
+# Seus links públicos (CSV)
 FIN_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ONyZQvlJTIYSmHX4fGZTtH5j3N5yalMjrGMfPsyrEbE/gviz/tq?tqx=out:csv&gid=0"
 INS_URL_DEFAULT = "https://docs.google.com/spreadsheets/d/1ONyZQvlJTIYSmHX4fGZTtH5j3N5yalMjrGMfPsyrEbE/gviz/tq?tqx=out:csv&gid=1836407575"
 
+# TTL (segundos) - pode configurar no Render: CONFIG_TTL_SECONDS=300, por exemplo
+CONFIG_TTL_SECONDS = int(os.getenv("CONFIG_TTL_SECONDS", "300"))
+
 FIN_URL = os.getenv("FIN_URL", FIN_URL_DEFAULT)
 INS_URL = os.getenv("INS_URL", INS_URL_DEFAULT)
-CONFIG_TTL_SECONDS = int(os.getenv("CONFIG_TTL_SECONDS", "300"))  # 5 minutos
 
+# cache em memória
+_last_load_ts: float = 0.0
 _fin_df: Optional[pd.DataFrame] = None
 _ins_df: Optional[pd.DataFrame] = None
-_last_load_ts: float = 0.0
 
 
-# =========================================================
-# Helpers de normalização
-# =========================================================
+def _now() -> float:
+    return time.time()
 
-def _norm_col(c: str) -> str:
-    # normaliza cabeçalho: tira espaços, lower
-    return str(c).strip().lower()
 
-def _to_bool(x) -> bool:
-    """Normaliza valores tipo TRUE/FALSE, Verdadeiro/Falso, 1/0, Sim/Não."""
+def _to_bool(x: Any) -> bool:
+    """
+    Aceita TRUE/FALSE, true/false, 1/0, sim/não etc.
+    """
     if x is None:
         return False
-    if isinstance(x, bool):
-        return x
     s = str(x).strip().lower()
-    return s in {"true", "verdadeiro", "1", "sim", "yes", "y"}
+    return s in ("true", "1", "sim", "yes", "y")
 
-def _to_float(x):
-    """Converte número vindo como '0.123' ou '0,123' ou '1.234,56'."""
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip()
-    if s == "":
-        return None
-    # tenta lidar com formatos 1.234,56
-    if s.count(",") == 1 and s.count(".") >= 1:
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        s = s.replace(",", ".")
+
+def _norm_col(s: str) -> str:
+    return str(s).strip().lower()
+
+
+def _fetch_csv_to_df(url: str) -> pd.DataFrame:
     try:
-        return float(s)
-    except:
-        return None
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Falha ao baixar CSV: {url} | erro: {e}")
 
-def _extract_age_from_label(label: Any) -> Optional[int]:
-    # "MIP por idade - 35" -> 35
-    if label is None:
-        return None
-    m = re.search(r"(\d+)\s*$", str(label).strip())
-    return int(m.group(1)) if m else None
+    # pandas lê direto de string
+    from io import StringIO
+    return pd.read_csv(StringIO(r.text))
 
-
-# =========================================================
-# Loader de configs com TTL
-# =========================================================
 
 def load_configs(force: bool = False) -> None:
-    """Carrega as configs do Google Sheets. Usa cache por TTL."""
-    global _fin_df, _ins_df, _last_load_ts
-    now = time.time()
+    """
+    Carrega Financiamento e Seguros_export com cache TTL.
+    """
+    global _last_load_ts, _fin_df, _ins_df
 
-    if not force and _fin_df is not None and _ins_df is not None:
-        if (now - _last_load_ts) < CONFIG_TTL_SECONDS:
+    if (not force) and _fin_df is not None and _ins_df is not None:
+        if (_now() - _last_load_ts) < CONFIG_TTL_SECONDS:
             return
 
-    try:
-        fin_raw = pd.read_csv(FIN_URL)
-        ins_raw = pd.read_csv(INS_URL)
-    except Exception as e:
-        raise RuntimeError(f"Falha ao carregar configs do Google Sheets CSV: {e}")
+    fin = _fetch_csv_to_df(FIN_URL)
+    ins = _fetch_csv_to_df(INS_URL)
 
-    # Normaliza nomes das colunas (lower + strip)
-    fin = fin_raw.copy()
+    # normaliza nomes de coluna
     fin.columns = [_norm_col(c) for c in fin.columns]
-
-    ins = ins_raw.copy()
     ins.columns = [_norm_col(c) for c in ins.columns]
 
     # ---------------------------
-    # FINANCIAMENTO (colunas mínimas)
+    # Validação de colunas mínimas
     # ---------------------------
-    required_fin = [
+    fin_required = [
+        "ativo",
         "banco",
         "operação",
         "amortização",
         "quota",
         "prazo máximo (meses)",
-        "comprometimento de renda",
         "taxa efetiva (a.a.)",
+        "comprometimento de renda",
     ]
-    for c in required_fin:
+    for c in fin_required:
         if c not in fin.columns:
             raise RuntimeError(f"Coluna obrigatória faltando em Financiamento: {c}")
 
-    # Ativo pode ser "ativo"
-    if "ativo" in fin.columns:
-        fin = fin[fin["ativo"].apply(_to_bool)].copy()
+    ins_required = ["ativo", "banco", "dfi_rate", "mip_rate", "idade"]
+    for c in ins_required:
+        if c not in ins.columns:
+            raise RuntimeError(f"Coluna obrigatória faltando em Seguros_export: {c}")
 
+    # ---------------------------
+    # Filtra apenas ativos
+    # ---------------------------
+    fin["ativo_bool"] = fin["ativo"].apply(_to_bool)
+    ins["ativo_bool"] = ins["ativo"].apply(_to_bool)
+
+    fin = fin[fin["ativo_bool"] == True].copy()
+    ins = ins[ins["ativo_bool"] == True].copy()
+
+    # Tipos úteis
     fin["banco"] = fin["banco"].astype(str).str.strip()
     fin["operação"] = fin["operação"].astype(str).str.strip()
     fin["amortização"] = fin["amortização"].astype(str).str.strip().str.upper()
 
-    for c in ["quota", "prazo máximo (meses)", "comprometimento de renda", "taxa efetiva (a.a.)"]:
-        fin[c] = fin[c].apply(_to_float)
-
-    fin = fin.dropna(subset=[
-        "banco", "operação", "amortização", "quota",
-        "prazo máximo (meses)", "comprometimento de renda", "taxa efetiva (a.a.)"
-    ]).copy()
-
-    # ---------------------------
-    # SEGUROS_EXPORT (aceita seu formato atual)
-    # Esperado (no mínimo): banco, dfi_rate, mip_rate, idade (ou mip_label para extrair)
-    # Pode ter extras: seguradora, mip_label etc.
-    # ---------------------------
-    if "banco" not in ins.columns:
-        raise RuntimeError("Coluna obrigatória faltando em Seguros_export: Banco")
-
-    # Ativo pode ser "ativo"
-    if "ativo" in ins.columns:
-        ins = ins[ins["ativo"].apply(_to_bool)].copy()
-
-    if "dfi_rate" not in ins.columns:
-        raise RuntimeError("Coluna obrigatória faltando em Seguros_export: dfi_rate")
-    if "mip_rate" not in ins.columns:
-        raise RuntimeError("Coluna obrigatória faltando em Seguros_export: mip_rate")
-
-    # idade: se não existir, tenta extrair de mip_label
-    if "idade" not in ins.columns:
-        if "mip_label" in ins.columns:
-            ins["idade"] = ins["mip_label"].apply(_extract_age_from_label)
-        else:
-            raise RuntimeError("Coluna obrigatória faltando em Seguros_export: idade (ou mip_label para extrair)")
-
     ins["banco"] = ins["banco"].astype(str).str.strip()
-    ins["idade"] = ins["idade"].apply(lambda v: int(float(v)) if str(v).strip() != "" else None)
-    ins["mip_rate"] = ins["mip_rate"].apply(_to_float)
-    ins["dfi_rate"] = ins["dfi_rate"].apply(_to_float)
+    ins["idade"] = pd.to_numeric(ins["idade"], errors="coerce").fillna(0).astype(int)
 
-    ins = ins.dropna(subset=["banco", "idade", "mip_rate", "dfi_rate"]).copy()
+    # ordena pra facilitar fallback de idade
+    ins = ins.sort_values(["banco", "idade"]).reset_index(drop=True)
 
     _fin_df = fin
     _ins_df = ins
-    _last_load_ts = now
-
-
-@app.on_event("startup")
-def _startup():
-    # Se der erro aqui, o Render mostra o motivo no log
-    load_configs(force=True)
+    _last_load_ts = _now()
 
 
 # =========================================================
-# Utils
+# Helpers Financeiros
 # =========================================================
 
 def annual_to_monthly(annual_rate: float) -> float:
-    # taxa efetiva anual -> efetiva mensal
+    # taxa efetiva a.a. -> taxa efetiva a.m.
     return pow(1.0 + annual_rate, 1.0 / 12.0) - 1.0
+
 
 def calc_age(birth_date_iso: str) -> int:
     y, m, d = map(int, birth_date_iso.split("-"))
@@ -187,10 +142,15 @@ def calc_age(birth_date_iso: str) -> int:
         age -= 1
     return age
 
+
 def clamp_age(age: int, min_age: int = 18, max_age: int = 80) -> int:
     return max(min_age, min(max_age, age))
 
+
 def price_factor(i_m: float, n: int) -> float:
+    """
+    fator de pagamento PRICE (sem seguros): parcela = PV * k
+    """
     if n <= 0:
         raise ValueError("n must be > 0")
     if i_m <= 0:
@@ -198,13 +158,16 @@ def price_factor(i_m: float, n: int) -> float:
     a = pow(1.0 + i_m, n)
     return (i_m * a) / (a - 1.0)
 
+
 _money_re = re.compile(r"R\$\s*([\d\.\,]+)")
+
 
 def parse_brl_money(s: Any) -> Optional[float]:
     """
     Aceita:
       - "R$ 200,00 (de Parcela)"
       - "R$750.000,00"
+      - números
     """
     if s is None:
         return None
@@ -220,42 +183,22 @@ def parse_brl_money(s: Any) -> Optional[float]:
     except:
         return None
 
+
 def is_min_installment_field(s: Any) -> bool:
     if s is None:
         return False
     return "parcela" in str(s).lower()
+
 
 def brl(x: float) -> str:
     s = f"{x:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {s}"
 
-def build_whatsapp_text(operation: str, bank: str, price: Optional[dict], sac: Optional[dict]) -> str:
-    lines = [f"📌 Simulação ({operation}) — {bank}\n"]
 
-    if price and price.get("fits"):
-        lines += [
-            "✅ Opção com MENOR entrada (PRICE)",
-            f"• Imóvel até: {brl(price['property_value'])}",
-            f"• Entrada aprox.: {brl(price['down_payment'])}",
-            f"• Financiamento: {brl(price['pv_financing'])}",
-            f"• Parcela inicial estimada: {brl(price['month1_installment'])}",
-            ""
-        ]
-
-    if sac and sac.get("fits"):
-        lines += [
-            "🚀 Opção com MAIOR potencial (SAC)",
-            f"• Imóvel até: {brl(sac['property_value'])}",
-            f"• Entrada aprox.: {brl(sac['down_payment'])}",
-            f"• Financiamento: {brl(sac['pv_financing'])}",
-            f"• Parcela inicial estimada: {brl(sac['month1_installment'])}",
-            ""
-        ]
-
-    lines.append("Quer que eu simule em outros bancos também?")
-    return "\n".join(lines).strip()
-
+# =========================================================
+# Seguro (DFI + MIP) por banco + idade
+# =========================================================
 
 def get_insurance_rates(bank: str, age: int) -> Optional[Dict[str, float]]:
     load_configs()  # respeita TTL
@@ -279,137 +222,11 @@ def get_insurance_rates(bank: str, age: int) -> Optional[Dict[str, float]]:
 
 
 # =========================================================
-# Endpoints básicos
+# Simulação (potencial)
 # =========================================================
-
-@app.get("/health")
-def health():
-    return {"ok": True, "ttl_seconds": CONFIG_TTL_SECONDS}
-
-@app.get("/configs/operations")
-def list_operations() -> Dict[str, Any]:
-    load_configs()
-    ops = sorted(_fin_df["operação"].dropna().unique().tolist())
-    return {"ok": True, "operations": ops}
-
-@app.get("/configs/banks")
-def list_banks() -> Dict[str, Any]:
-    load_configs()
-    banks = sorted(_fin_df["banco"].dropna().unique().tolist())
-    return {"ok": True, "banks": banks}
-
-
-# =========================================================
-# SAC (simulação e fit)
-# =========================================================
-
-class SacRequest(BaseModel):
-    property_value: float
-    quota: float
-    term_months: int
-    annual_rate: float
-    birth_date: str
-    mip_rate: float
-    dfi_rate: float
-    monthly_income: Optional[float] = None
-    commitment_rate: Optional[float] = None
-
-@app.post("/simulate/sac")
-def simulate_sac(req: SacRequest) -> Dict[str, Any]:
-    pv = req.property_value * req.quota
-    down_payment = req.property_value - pv
-
-    i_m = annual_to_monthly(req.annual_rate)
-    amort = pv / req.term_months
-    interest = pv * i_m
-
-    age = calc_age(req.birth_date)
-    mip = pv * req.mip_rate
-    dfi = req.property_value * req.dfi_rate
-
-    installment = amort + interest + mip + dfi
-
-    fits = None
-    max_installment = None
-    if req.monthly_income and req.commitment_rate:
-        max_installment = req.monthly_income * req.commitment_rate
-        fits = installment <= max_installment
-
-    return {
-        "age": age,
-        "monthly_rate": round(i_m, 8),
-        "pv": round(pv, 2),
-        "down_payment": round(down_payment, 2),
-        "month1": {
-            "amortization": round(amort, 2),
-            "interest": round(interest, 2),
-            "mip": round(mip, 2),
-            "dfi": round(dfi, 2),
-            "installment_total": round(installment, 2),
-        },
-        "income_check": {
-            "max_installment": round(max_installment, 2) if max_installment is not None else None,
-            "fits": fits,
-        }
-    }
-
-class SacFitRequest(BaseModel):
-    property_value: float
-    max_quota: float
-    term_months: int
-    annual_rate: float
-    mip_rate: float
-    dfi_rate: float
-    monthly_income: float
-    commitment_rate: float
-
-@app.post("/simulate/sac/fit")
-def fit_sac(req: SacFitRequest) -> Dict[str, Any]:
-    max_installment = req.monthly_income * req.commitment_rate
-    i_m = annual_to_monthly(req.annual_rate)
-
-    B = req.property_value * req.dfi_rate
-    A = (1.0 / req.term_months) + i_m + req.mip_rate
-
-    if max_installment <= B:
-        return {
-            "ok": True,
-            "fits": False,
-            "reason": "max_installment <= fixed_costs (DFI)",
-            "max_installment_allowed": round(max_installment, 2),
-            "fixed_costs_dfi": round(B, 2),
-            "pv_by_income": 0.0,
-            "pv_by_ltv": round(req.property_value * req.max_quota, 2),
-            "pv_allowed": 0.0,
-        }
-
-    pv_by_income = (max_installment - B) / A
-    pv_by_ltv = req.property_value * req.max_quota
-    pv_allowed = max(0.0, min(pv_by_income, pv_by_ltv))
-
-    return {
-        "ok": True,
-        "fits": pv_allowed > 0,
-        "max_installment_allowed": round(max_installment, 2),
-        "pv_by_income": round(pv_by_income, 2),
-        "pv_by_ltv": round(pv_by_ltv, 2),
-        "pv_allowed": round(pv_allowed, 2),
-    }
-
-
-# =========================================================
-# POTENCIAL
-# =========================================================
-
-class PotentialRequest(BaseModel):
-    monthly_income: float = Field(..., gt=0)
-    birth_date: str = Field(..., description="YYYY-MM-DD")
-    operation: str
-    banks: Optional[List[str]] = None
-
 
 def simulate_potential_row(
-    amortization: str,  # "SAC" ou "PRICE"
+    amortization: str,  # "SAC", "PRICE", "MIX"
     quota: float,
     term_months: int,
     annual_rate: float,
@@ -419,15 +236,34 @@ def simulate_potential_row(
     mip_rate: float,
     min_value_field: Any,
 ) -> Dict[str, Any]:
+    """
+    Retorna o maior PV (financiamento) possível que caiba na renda,
+    considerando seguros (DFI/MIP) e quota (LTV).
+
+    Obs:
+    - DFI calculado em cima do VALOR DO IMÓVEL => (PV/quota) * dfi_rate
+    - MIP calculado em cima do PV => PV * mip_rate
+    """
+    if income <= 0:
+        return {"ok": False, "fits": False, "error": "invalid_income", "message": "monthly_income must be > 0"}
+    if not (0 < quota <= 1):
+        return {"ok": False, "fits": False, "error": "invalid_quota", "message": "quota must be between 0 and 1"}
+    if term_months <= 0:
+        return {"ok": False, "fits": False, "error": "invalid_term", "message": "term_months must be > 0"}
+
     i_m = annual_to_monthly(annual_rate)
     max_installment = income * commitment_rate
 
     # DFI depende do valor do imóvel = PV/quota  => DFI = (PV/quota)*dfi_rate = PV*(dfi_rate/quota)
     dfi_per_pv = dfi_rate / quota
 
+    amortization = (amortization or "").strip().upper()
+
+    # ---- SAC
     if amortization == "SAC":
+        # parcela = PV*(1/n + i_m + mip + dfi_per_pv)
         A = (1.0 / term_months) + i_m + mip_rate + dfi_per_pv
-        pv_allowed = max_installment / A
+        pv_allowed = max_installment / A if A > 0 else 0.0
 
         amort = pv_allowed / term_months
         interest = pv_allowed * i_m
@@ -435,10 +271,11 @@ def simulate_potential_row(
         dfi = (pv_allowed / quota) * dfi_rate
         installment = amort + interest + mip + dfi
 
+    # ---- PRICE
     elif amortization == "PRICE":
-        k = price_factor(i_m, term_months)
+        k = price_factor(i_m, term_months)  # parcela sem seguros = PV*k
         A = k + mip_rate + dfi_per_pv
-        pv_allowed = max_installment / A
+        pv_allowed = max_installment / A if A > 0 else 0.0
 
         payment_no_insurance = pv_allowed * k
         interest = pv_allowed * i_m
@@ -447,8 +284,30 @@ def simulate_potential_row(
         dfi = (pv_allowed / quota) * dfi_rate
         installment = payment_no_insurance + mip + dfi
 
+    # ---- MIX (implementação simples/intermediária)
+    # fator MIX = média entre "SAC sem seguros" e "PRICE sem seguros"
+    elif amortization == "MIX":
+        k_price = price_factor(i_m, term_months)
+        k_sac = (1.0 / term_months) + i_m
+        k_mix = (k_price + k_sac) / 2.0
+
+        A = k_mix + mip_rate + dfi_per_pv
+        pv_allowed = max_installment / A if A > 0 else 0.0
+
+        payment_no_insurance = pv_allowed * k_mix
+        interest = pv_allowed * i_m
+        amort = payment_no_insurance - interest
+        mip = pv_allowed * mip_rate
+        dfi = (pv_allowed / quota) * dfi_rate
+        installment = payment_no_insurance + mip + dfi
+
     else:
-        raise ValueError(f"Unsupported amortization: {amortization}")
+        return {
+            "ok": False,
+            "fits": False,
+            "error": "unsupported_amortization",
+            "message": f"Unsupported amortization: {amortization}",
+        }
 
     property_value = pv_allowed / quota
     down_payment = property_value - pv_allowed
@@ -472,6 +331,7 @@ def simulate_potential_row(
         "fits": pv_allowed > 0 and min_ok,
         "min_rule_ok": min_ok,
         "min_rule_reason": min_reason,
+        "amortization": amortization,
         "quota": round(quota, 4),
         "term_months": int(term_months),
         "annual_rate": float(annual_rate),
@@ -486,37 +346,146 @@ def simulate_potential_row(
             "interest": round(interest, 2),
             "mip": round(mip, 2),
             "dfi": round(dfi, 2),
-        }
+        },
     }
+
+
+def build_summary_text(operation: str, age: int, income: float, results: List[Dict[str, Any]]) -> str:
+    """
+    Texto leigo e comparativo sempre.
+    Mostra:
+      - Melhor potencial (maior valor de imóvel) entre todos os bancos/sistemas que "fits"
+      - Menor entrada (menor down_payment) entre todos que "fits"
+      - Observações de bancos que ficaram fora (ex: sem seguro)
+    """
+    fits_items: List[Tuple[str, str, Dict[str, Any]]] = []
+    not_ok_msgs: List[str] = []
+
+    for item in results:
+        bank = item.get("bank")
+        for sys in ("PRICE", "SAC", "MIX"):
+            r = item.get(sys)
+            if r is None:
+                continue
+            if r.get("ok") is False:
+                # erro do tipo missing_insurance / unsupported...
+                msg = r.get("message") or r.get("error") or "erro"
+                not_ok_msgs.append(f"• {bank} ({sys}): {msg}")
+                continue
+            if r.get("fits"):
+                fits_items.append((bank, sys, r))
+
+    lines = []
+    lines.append(f"📌 *Simulação de Potencial*")
+    lines.append(f"• Operação: {operation}")
+    lines.append(f"• Idade: {age} anos")
+    lines.append(f"• Renda mensal considerada: {brl(income)}")
+    lines.append("")
+
+    if not fits_items:
+        lines.append("❌ No momento, *nenhuma opção* coube nas regras (renda/limites/seguros).")
+        if not_ok_msgs:
+            lines.append("")
+            lines.append("⚠️ Observações:")
+            lines.extend(not_ok_msgs[:8])
+        return "\n".join(lines).strip()
+
+    # melhor potencial = maior property_value
+    best = max(fits_items, key=lambda t: float(t[2]["property_value"]))
+    # menor entrada = menor down_payment
+    low = min(fits_items, key=lambda t: float(t[2]["down_payment"]))
+
+    b_bank, b_sys, b_r = best
+    l_bank, l_sys, l_r = low
+
+    lines.append("✅ *Melhor POTENCIAL (maior valor de imóvel)*")
+    lines.append(f"• Banco: {b_bank} ({b_sys})")
+    lines.append(f"• Imóvel até: {brl(b_r['property_value'])}")
+    lines.append(f"• Entrada aprox.: {brl(b_r['down_payment'])}")
+    lines.append(f"• Parcela inicial: {brl(b_r['month1_installment'])}")
+    lines.append("")
+
+    lines.append("✅ *Menor ENTRADA (menor valor de entrada)*")
+    lines.append(f"• Banco: {l_bank} ({l_sys})")
+    lines.append(f"• Imóvel até: {brl(l_r['property_value'])}")
+    lines.append(f"• Entrada aprox.: {brl(l_r['down_payment'])}")
+    lines.append(f"• Parcela inicial: {brl(l_r['month1_installment'])}")
+    lines.append("")
+
+    # Ranking curto (top 3 potenciais)
+    fits_sorted = sorted(fits_items, key=lambda t: float(t[2]["property_value"]), reverse=True)[:3]
+    lines.append("📊 *Top 3 por valor de imóvel*")
+    for i, (bk, sys, rr) in enumerate(fits_sorted, start=1):
+        lines.append(f"{i}) {bk} ({sys}) — Imóvel até {brl(rr['property_value'])} | Entrada {brl(rr['down_payment'])}")
+
+    if not_ok_msgs:
+        lines.append("")
+        lines.append("⚠️ Bancos/opções ignorados por configuração:")
+        lines.extend(not_ok_msgs[:8])
+
+    return "\n".join(lines).strip()
+
+
+# =========================================================
+# API
+# =========================================================
+
+app = FastAPI(title="Sati Simulador API")
+
+
+class PotentialRequest(BaseModel):
+    monthly_income: float = Field(..., gt=0)
+    birth_date: str = Field(..., description="YYYY-MM-DD")
+    operation: str
+    banks: Optional[List[str]] = None  # opcional: filtrar
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "ttl_seconds": CONFIG_TTL_SECONDS}
+
+
+@app.get("/configs/operations")
+def list_operations() -> Dict[str, Any]:
+    load_configs()
+    if _fin_df is None:
+        return {"ok": False, "operations": []}
+    ops = sorted(_fin_df["operação"].dropna().unique().tolist())
+    return {"ok": True, "operations": ops}
 
 
 @app.post("/simulate/potential")
 def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
     load_configs()  # usa cache TTL
 
+    if _fin_df is None:
+        raise HTTPException(status_code=500, detail="Config de financiamento não carregada")
+
     age = calc_age(req.birth_date)
 
     fin = _fin_df[_fin_df["operação"].str.lower() == req.operation.strip().lower()].copy()
     if fin.empty:
-        raise HTTPException(status_code=422, detail=f"Nenhuma config para operation='{req.operation}'")
+        raise HTTPException(status_code=422, detail=f"Nenhuma config para operation='{req.operation}' (e/ou todas estão inativas)")
 
+    # Filtro opcional de bancos
     if req.banks:
         wanted = {b.strip().lower() for b in req.banks}
         fin = fin[fin["banco"].str.lower().isin(wanted)]
         if fin.empty:
-            raise HTTPException(status_code=422, detail="Filtro de banks removeu todas as configs")
+            raise HTTPException(status_code=422, detail="Filtro de banks removeu todas as configs (ou ficaram inativas)")
 
+    # Agrupa por banco e preenche PRICE/SAC/MIX
     results_by_bank: Dict[str, Dict[str, Any]] = {}
 
     for _, row in fin.iterrows():
         bank = str(row["banco"]).strip()
         amortization = str(row["amortização"]).strip().upper()
-        quota = float(row["quota"])
-        term = int(float(row["prazo máximo (meses)"]))
-        annual_rate = float(row["taxa efetiva (a.a.)"])
-        commitment = float(row["comprometimento de renda"])
-        min_value_field = row.get("valor mínimo", None)
 
+        # Garante chaves do banco
+        if bank not in results_by_bank:
+            results_by_bank[bank] = {"bank": bank, "PRICE": None, "SAC": None, "MIX": None}
+
+        # Seguros
         ins = get_insurance_rates(bank, age)
 
         if ins is None:
@@ -524,9 +493,15 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
                 "ok": False,
                 "fits": False,
                 "error": "missing_insurance",
-                "message": f"Banco sem seguros_export: {bank}"
+                "message": f"Banco sem seguros_export: {bank}",
             }
         else:
+            quota = float(row["quota"])
+            term = int(float(row["prazo máximo (meses)"]))
+            annual_rate = float(row["taxa efetiva (a.a.)"])
+            commitment = float(row["comprometimento de renda"])
+            min_value_field = row.get("valor mínimo", None)
+
             sim = simulate_potential_row(
                 amortization=amortization,
                 quota=quota,
@@ -539,25 +514,31 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
                 min_value_field=min_value_field,
             )
 
-        if bank not in results_by_bank:
-            results_by_bank[bank] = {"bank": bank, "PRICE": None, "SAC": None}
-
-        # Se tiver duplicidade no sheet, mantém o último (ou você pode criar regra aqui)
-        results_by_bank[bank][amortization] = sim
+        # mantém o último caso tenha duplicidade
+        if amortization in ("PRICE", "SAC", "MIX"):
+            results_by_bank[bank][amortization] = sim
+        else:
+            # amortização desconhecida cai como erro numa chave segura
+            results_by_bank[bank][amortization] = {
+                "ok": False,
+                "fits": False,
+                "error": "unsupported_amortization",
+                "message": f"Unsupported amortization: {amortization}",
+            }
 
     results = list(results_by_bank.values())
 
-    # -----------------------------------------------------
-    # SUMMARY: melhor potencial (maior property_value) e menor entrada
-    # -----------------------------------------------------
+    # summary “objeto” (pra Make) — ignorando os que não cabem
     best_property = None
     lowest_entry = None
 
     for item in results:
         bank = item["bank"]
-        for sys in ("PRICE", "SAC"):
+        for sys in ("PRICE", "SAC", "MIX"):
             r = item.get(sys)
-            if not r or not r.get("fits"):
+            if not r or not isinstance(r, dict):
+                continue
+            if not r.get("ok") or not r.get("fits"):
                 continue
 
             if best_property is None or r["property_value"] > best_property["property_value"]:
@@ -580,14 +561,7 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
                     "month1_installment": r["month1_installment"],
                 }
 
-    # -----------------------------------------------------
-    # WhatsApp text (se tiver 1 banco, já fica perfeito)
-    # Se tiver vários bancos, você pode montar no Make usando o "summary"
-    # -----------------------------------------------------
-    whatsapp_text = None
-    if len(results) == 1:
-        b = results[0]
-        whatsapp_text = build_whatsapp_text(req.operation, b["bank"], b.get("PRICE"), b.get("SAC"))
+    summary_text = build_summary_text(req.operation, age, req.monthly_income, results)
 
     return {
         "ok": True,
@@ -597,6 +571,6 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
             "best_property_value": best_property,
             "lowest_down_payment": lowest_entry,
         },
-        "whatsapp_text": whatsapp_text,
+        "summary_text": summary_text,   # <-- sempre preenchido (texto leigo)
         "results": results,
     }
