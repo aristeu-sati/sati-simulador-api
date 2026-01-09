@@ -858,11 +858,66 @@ def simulate_with_property(req: PropertySimulationRequest) -> Dict[str, Any]:
     amort_plus_interest = comps_allowed["amortization"] + comps_allowed["interest"]
     admin_fee = 0.0  # não modelado no backend (por ora)
 
+    
+    # Cenário principal desta rota: SEMPRE no limite da quota (LTV máximo)
+    pv_main = pv_by_ltv
+    down_payment_main = req.property_value - pv_main
+    comps_main = comps_at_max_quota
+
+    # Indicadores para encaixar na renda atual (quando renda < necessário)
+    pv_fit_income = max(0.0, min(pv_by_income, pv_by_ltv))
+    down_payment_fit_income = req.property_value - pv_fit_income
+    comps_fit_income = month1_components(amort, pv_fit_income, term, annual_rate, quota, dfi_rate, mip_rate) if pv_fit_income > 0 else {
+        "amortization": 0.0, "interest": 0.0, "mip": 0.0, "dfi": 0.0, "installment": 0.0
+    }
+
+    # Renda necessária para suportar o cenário de quota máxima
+    max_installment = req.monthly_income * commitment
+    required_income_for_max_quota = comps_main["installment"] / commitment if commitment > 0 else float("inf")
+
+    # Flags
+    income_sufficient_for_max_quota = comps_main["installment"] <= max_installment + 1e-6
+
+    # Helpers de formatação (pt-BR) para mensagem
+    def _brl(x: float) -> str:
+        s = f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"R$ {s}"
+
+    def _pct(x: float, d: int = 2) -> str:
+        return f"{x*100:.{d}f}%".replace(".", ",")
+
+    # Mensagem pronta para WhatsApp (texto leigo)
+    if income_sufficient_for_max_quota:
+        whatsapp_message = (
+            f"✅ Simulação de financiamento ({bank} — {operation})\n"
+            f"• Valor do imóvel: {_brl(req.property_value)}\n"
+            f"• Financiamento (quota {int(quota*100)}%): {_brl(pv_main)}\n"
+            f"• Entrada: {_brl(down_payment_main)}\n"
+            f"• 1ª prestação estimada: {_brl(comps_main['installment'])}\n"
+            f"• Taxa efetiva: {_pct(rate_effective_aa)} a.a. | {_pct(rate_effective_am, 4)} a.m.\n"
+            f"\nObs.: esta é uma simulação (valores podem variar na análise do banco)."
+        )
+    else:
+        extra_entry = max(0.0, down_payment_fit_income - down_payment_main)
+        whatsapp_message = (
+            f"⚠️ Simulação de financiamento ({bank} — {operation})\n"
+            f"• Valor do imóvel: {_brl(req.property_value)}\n"
+            f"• No limite da quota ({int(quota*100)}%): financia {_brl(pv_main)} com entrada {_brl(down_payment_main)}\n"
+            f"• 1ª prestação nesse cenário: {_brl(comps_main['installment'])}\n"
+            f"\n➡️ Sua renda atual (comprometimento {_pct(commitment)}): suporta até aprox. {_brl(pv_fit_income)} financiado\n"
+            f"• Entrada para encaixar na renda atual: {_brl(down_payment_fit_income)} ( +{_brl(extra_entry)} vs. entrada mínima )\n"
+            f"• 1ª prestação no cenário que cabe na renda: {_brl(comps_fit_income['installment'])}\n"
+            f"\n📌 Para manter o financiamento de {_brl(pv_main)}, a renda necessária seria aprox. {_brl(required_income_for_max_quota)}\n"
+            f"\nObs.: esta é uma simulação (valores podem variar na análise do banco)."
+        )
+
     return {
-        # status
         "ok": True,
-        "fits": fits,
-        "fits_at_max_quota": fits_at_max_quota,
+
+        # Neste endpoint, `fits` significa: renda suficiente para o cenário de quota máxima
+        "fits": income_sufficient_for_max_quota,
+        "fits_at_max_quota": income_sufficient_for_max_quota,
+
         "min_rule_ok": min_ok,
         "min_rule_reason": min_reason,
 
@@ -881,45 +936,69 @@ def simulate_with_property(req: PropertySimulationRequest) -> Dict[str, Any]:
             "commitment_rate": commitment,
         },
 
-        # valores exibidos no card
+        # valores do CARD (sempre no limite da quota)
         "values": {
-            "amortization_plus_interest": amort_plus_interest,
-            "mip": comps_allowed["mip"],
-            "dfi": comps_allowed["dfi"],
+            "amortization_plus_interest": comps_main["amortization"] + comps_main["interest"],
+            "mip": comps_main["mip"],
+            "dfi": comps_main["dfi"],
             "admin_fee": admin_fee,
-            "installment": comps_allowed["installment"],
+            "installment": comps_main["installment"],
         },
 
-        # resumo financeiro
+        # resumo do CARD (sempre no limite da quota)
         "summary": {
-            "property_value": req.property_value,
-            "pv_allowed": pv_allowed,
-            "down_payment_required": down_payment,
-            "first_installment": comps_allowed["installment"],
+            "property_value": float(req.property_value),
+            "pv_allowed": pv_main,
+            "down_payment_required": down_payment_main,
+            "first_installment": comps_main["installment"],
         },
 
-        # detalhes úteis (mantém compatibilidade e auditoria)
+        # indicadores de encaixe
+        "income_sufficient_for_max_quota": income_sufficient_for_max_quota,
+        "required_income_for_max_quota": required_income_for_max_quota,
+        "pv_fit_income": pv_fit_income,
+        "down_payment_required_to_fit_income": down_payment_fit_income,
+        "first_installment_at_pv_fit_income": comps_fit_income["installment"],
+
+        # detalhes úteis (auditoria)
         "pv_by_income": pv_by_income,
         "pv_by_ltv": pv_by_ltv,
-        "pv_allowed": pv_allowed,
-        "suggested_quota": suggested_quota,
-        "min_down_payment_required": down_payment,
-        "month1_installment_at_pv_allowed": comps_allowed["installment"],
-        "month1_installment_at_max_quota": comps_at_max_quota["installment"],
+
+        # compatibilidade com campos anteriores
+        "pv_allowed": pv_main,
+        "suggested_quota": pv_main / req.property_value if req.property_value > 0 else 0.0,
+        "min_down_payment_required": down_payment_main,
+        "month1_installment_at_pv_allowed": comps_main["installment"],
+        "month1_installment_at_max_quota": comps_main["installment"],
+
         "components_at_pv_allowed": {
-            "amortization": comps_allowed["amortization"],
-            "interest": comps_allowed["interest"],
-            "mip": comps_allowed["mip"],
-            "dfi": comps_allowed["dfi"],
+            "amortization": comps_main["amortization"],
+            "interest": comps_main["interest"],
+            "mip": comps_main["mip"],
+            "dfi": comps_main["dfi"],
         },
+
         "components_at_max_quota": {
-            "amortization": comps_at_max_quota["amortization"],
-            "interest": comps_at_max_quota["interest"],
-            "mip": comps_at_max_quota["mip"],
-            "dfi": comps_at_max_quota["dfi"],
+            "amortization": comps_main["amortization"],
+            "interest": comps_main["interest"],
+            "mip": comps_main["mip"],
+            "dfi": comps_main["dfi"],
         },
+
+        # cenário que cabe na renda (se precisar)
+        "components_at_pv_fit_income": {
+            "amortization": comps_fit_income["amortization"],
+            "interest": comps_fit_income["interest"],
+            "mip": comps_fit_income["mip"],
+            "dfi": comps_fit_income["dfi"],
+            "installment": comps_fit_income["installment"],
+        },
+
+        # mensagem pronta
+        "whatsapp_message": whatsapp_message,
+
         "inputs": {
-            "monthly_income": req.monthly_income,
+            "monthly_income": float(req.monthly_income),
             "birth_date": req.birth_date,
             "age": age,
         },
