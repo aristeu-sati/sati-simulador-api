@@ -479,6 +479,140 @@ class PotentialRequest(BaseModel):
     banks: Optional[List[str]] = None  # opcional: filtrar
 
 
+class PropertySimulationRequest(BaseModel):
+    bank: str = Field(..., description="Nome do banco (deve existir na configuração)")
+    operation: str = Field(..., description="Operação (deve existir na configuração)")
+    property_value: float = Field(..., gt=0, description="Valor do imóvel (R$)")
+    monthly_income: float = Field(..., gt=0, description="Renda mensal (R$)")
+    birth_date: str = Field(..., description="YYYY-MM-DD")
+    amortization_system: Optional[str] = Field(
+        None,
+        description="Opcional. Se informado, força o sistema (SAC/PRICE/MIX). Se omitido, usa o configurado na operação/banco.",
+    )
+
+
+
+def month1_components(
+    amortization: str,
+    pv: float,
+    term_months: int,
+    annual_rate: float,
+    quota: float,
+    dfi_rate: float,
+    mip_rate: float,
+) -> Dict[str, float]:
+    """Calcula componentes da 1ª parcela (mês 1) para um PV informado."""
+    i_m = annual_to_monthly(annual_rate)
+    amort = amortization.strip().upper()
+
+    mip = pv * mip_rate
+    dfi = (pv / quota) * dfi_rate  # DFI sobre valor do imóvel
+
+    if amort == "SAC":
+        amort_value = pv / term_months
+        interest = pv * i_m
+        installment = amort_value + interest + mip + dfi
+        return {
+            "amortization": amort_value,
+            "interest": interest,
+            "mip": mip,
+            "dfi": dfi,
+            "installment": installment,
+        }
+
+    if amort == "PRICE":
+        k = (i_m * (1 + i_m) ** term_months) / ((1 + i_m) ** term_months - 1)
+        installment_base = pv * k
+        # no mês 1: juros = PV*i_m, amort = parcela_base - juros
+        interest = pv * i_m
+        amort_value = installment_base - interest
+        installment = installment_base + mip + dfi
+        return {
+            "amortization": amort_value,
+            "interest": interest,
+            "mip": mip,
+            "dfi": dfi,
+            "installment": installment,
+        }
+
+    if amort == "MIX":
+        # Regra explícita: mês 1 segue PRICE base + amortização acelerada (1.2x)
+        k = (i_m * (1 + i_m) ** term_months) / ((1 + i_m) ** term_months - 1)
+        installment_base = pv * k
+        interest = pv * i_m
+        amort_value = (installment_base - interest) * 1.2
+        installment = amort_value + interest + mip + dfi
+        return {
+            "amortization": amort_value,
+            "interest": interest,
+            "mip": mip,
+            "dfi": dfi,
+            "installment": installment,
+        }
+
+    raise ValueError(f"Unsupported amortization system: {amortization}")
+
+
+def pv_by_income_limit(
+    amortization: str,
+    quota: float,
+    term_months: int,
+    annual_rate: float,
+    commitment_rate: float,
+    income: float,
+    dfi_rate: float,
+    mip_rate: float,
+    pv_search_cap: float,
+) -> float:
+    """Calcula o PV máximo pelo limite de renda (1ª parcela <= renda*comprometimento)."""
+    i_m = annual_to_monthly(annual_rate)
+    max_installment = income * commitment_rate
+    amort = amortization.strip().upper()
+
+    # Fórmulas fechadas quando possível
+    if amort == "SAC":
+        denom = (1 / term_months) + i_m + mip_rate + (dfi_rate / quota)
+        if denom <= 0:
+            return 0.0
+        return max(0.0, max_installment / denom)
+
+    if amort == "PRICE":
+        k = (i_m * (1 + i_m) ** term_months) / ((1 + i_m) ** term_months - 1)
+        denom = k + mip_rate + (dfi_rate / quota)
+        if denom <= 0:
+            return 0.0
+        return max(0.0, max_installment / denom)
+
+    # MIX: resolver por busca (monótono em PV)
+    # Vamos buscar PV em [0, cap] onde cap é seguro (ex.: pv_by_ltv ou outro).
+    lo, hi = 0.0, max(0.0, pv_search_cap)
+    if hi == 0.0:
+        return 0.0
+
+    # garante que hi estoura (se não, aumenta até 4x cap ou até que estoure)
+    def inst(pv: float) -> float:
+        return month1_components(amort, pv, term_months, annual_rate, quota, dfi_rate, mip_rate)["installment"]
+
+    if inst(hi) <= max_installment:
+        # tenta aumentar hi até estourar, com limite
+        for _ in range(6):
+            hi2 = hi * 2
+            if hi2 <= 0 or hi2 > pv_search_cap * 8:
+                break
+            if inst(hi2) > max_installment:
+                hi = hi2
+                break
+            hi = hi2
+
+    # binária
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if inst(mid) <= max_installment:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
 @app.get("/health")
 def health():
     return {"ok": True, "ttl_seconds": CONFIG_TTL_SECONDS}
@@ -492,6 +626,21 @@ def list_operations() -> Dict[str, Any]:
     ops = sorted(_fin_df["operação"].dropna().unique().tolist())
     return {"ok": True, "operations": ops}
 
+
+
+@app.get("/configs/banks")
+def list_banks(operation: Optional[str] = None) -> Dict[str, Any]:
+    """Lista bancos disponíveis. Se 'operation' for informada, filtra bancos que possuem aquela operação."""
+    load_configs()
+    if _fin_df is None:
+        return {"ok": False, "banks": []}
+
+    df = _fin_df.copy()
+    if operation:
+        df = df[df["operação"].str.lower() == operation.strip().lower()]
+
+    banks = sorted({str(b).strip() for b in df["banco"].dropna().tolist() if str(b).strip()})
+    return {"ok": True, "banks": banks}
 
 @app.post("/simulate/potential")
 def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
@@ -613,4 +762,165 @@ def simulate_potential(req: PotentialRequest) -> Dict[str, Any]:
         },
         "summary_text": summary_text,   # <-- sempre preenchido (texto leigo)
         "results": results,
+    }
+
+
+
+@app.post("/simulate/property")
+def simulate_with_property(req: PropertySimulationRequest) -> Dict[str, Any]:
+    load_configs()  # usa cache TTL
+    if _fin_df is None:
+        raise HTTPException(status_code=500, detail="Config de financiamento não carregada")
+
+    age = calc_age(req.birth_date)
+
+    # Filtra config por banco + operação
+    df = _fin_df.copy()
+    df = df[df["banco"].str.lower() == req.bank.strip().lower()]
+    df = df[df["operação"].str.lower() == req.operation.strip().lower()]
+    if df.empty:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Nenhuma config para bank='{req.bank}' e operation='{req.operation}' (e/ou inativa).",
+        )
+
+    row = df.iloc[0]
+
+    bank = str(row["banco"]).strip()
+    operation = str(row["operação"]).strip()
+
+    # Sistema de amortização: força se vier no request, senão usa o configurado
+    amort_cfg = str(row["amortização"]).strip().upper()
+    amort = (req.amortization_system or amort_cfg).strip().upper()
+
+    quota = parse_float_any(row["quota"])
+    term = int(parse_float_any(row["prazo máximo (meses)"]))
+    annual_rate = parse_float_any(row["taxa efetiva (a.a.)"])
+    commitment = parse_float_any(row["comprometimento de renda"])
+    min_value_field = row.get("valor mínimo", None)
+
+    if not (0 < quota <= 1):
+        raise HTTPException(status_code=500, detail=f"Quota inválida para {bank}/{operation}: {quota}")
+
+    ins = get_insurance_rates(bank, age)
+    if ins is None:
+        raise HTTPException(status_code=422, detail=f"Banco sem seguros_export para cálculo: {bank}")
+
+    dfi_rate = parse_float_any(ins["dfi_rate"])
+    mip_rate = parse_float_any(ins["mip_rate"])
+
+    # limites
+    pv_by_ltv = req.property_value * quota
+    pv_by_income = pv_by_income_limit(
+        amortization=amort,
+        quota=quota,
+        term_months=term,
+        annual_rate=annual_rate,
+        commitment_rate=commitment,
+        income=req.monthly_income,
+        dfi_rate=dfi_rate,
+        mip_rate=mip_rate,
+        pv_search_cap=max(pv_by_ltv, 1.0),
+    )
+
+    pv_allowed = max(0.0, min(pv_by_ltv, pv_by_income))
+    suggested_quota = pv_allowed / req.property_value if req.property_value > 0 else 0.0
+    down_payment = req.property_value - pv_allowed
+
+    comps_allowed = month1_components(amort, pv_allowed, term, annual_rate, quota, dfi_rate, mip_rate) if pv_allowed > 0 else {
+        "amortization": 0.0, "interest": 0.0, "mip": 0.0, "dfi": 0.0, "installment": 0.0
+    }
+
+    comps_at_max_quota = month1_components(amort, pv_by_ltv, term, annual_rate, quota, dfi_rate, mip_rate)
+
+    # Regra de mínimo (se existir)
+    min_ok = True
+    min_reason = None
+    min_money = parse_brl_money(min_value_field)
+    if min_money is not None:
+        if is_min_installment_field(min_value_field):
+            if comps_allowed["installment"] < min_money:
+                min_ok = False
+                min_reason = f"installment<{min_money}"
+        else:
+            if req.property_value < min_money:
+                min_ok = False
+                min_reason = f"property_value<{min_money}"
+
+    fits = pv_allowed > 0 and min_ok and (comps_allowed["installment"] <= req.monthly_income * commitment + 1e-6)
+    fits_at_max_quota = comps_at_max_quota["installment"] <= req.monthly_income * commitment + 1e-6
+
+    i_m = annual_to_monthly(annual_rate)
+    rate_effective_am = i_m
+    rate_effective_aa = (1 + i_m) ** 12 - 1
+    rate_nominal_aa = i_m * 12
+
+    amort_plus_interest = comps_allowed["amortization"] + comps_allowed["interest"]
+    admin_fee = 0.0  # não modelado no backend (por ora)
+
+    return {
+        # status
+        "ok": True,
+        "fits": fits,
+        "fits_at_max_quota": fits_at_max_quota,
+        "min_rule_ok": min_ok,
+        "min_rule_reason": min_reason,
+
+        # básicos (para UI)
+        "bank": bank,
+        "operation": operation,
+        "amortization_system": amort,
+
+        # taxas
+        "rates": {
+            "effective_aa": rate_effective_aa,
+            "effective_am": rate_effective_am,
+            "nominal_aa": rate_nominal_aa,
+            "term_months": term,
+            "quota": quota,
+            "commitment_rate": commitment,
+        },
+
+        # valores exibidos no card
+        "values": {
+            "amortization_plus_interest": amort_plus_interest,
+            "mip": comps_allowed["mip"],
+            "dfi": comps_allowed["dfi"],
+            "admin_fee": admin_fee,
+            "installment": comps_allowed["installment"],
+        },
+
+        # resumo financeiro
+        "summary": {
+            "property_value": req.property_value,
+            "pv_allowed": pv_allowed,
+            "down_payment_required": down_payment,
+            "first_installment": comps_allowed["installment"],
+        },
+
+        # detalhes úteis (mantém compatibilidade e auditoria)
+        "pv_by_income": pv_by_income,
+        "pv_by_ltv": pv_by_ltv,
+        "pv_allowed": pv_allowed,
+        "suggested_quota": suggested_quota,
+        "min_down_payment_required": down_payment,
+        "month1_installment_at_pv_allowed": comps_allowed["installment"],
+        "month1_installment_at_max_quota": comps_at_max_quota["installment"],
+        "components_at_pv_allowed": {
+            "amortization": comps_allowed["amortization"],
+            "interest": comps_allowed["interest"],
+            "mip": comps_allowed["mip"],
+            "dfi": comps_allowed["dfi"],
+        },
+        "components_at_max_quota": {
+            "amortization": comps_at_max_quota["amortization"],
+            "interest": comps_at_max_quota["interest"],
+            "mip": comps_at_max_quota["mip"],
+            "dfi": comps_at_max_quota["dfi"],
+        },
+        "inputs": {
+            "monthly_income": req.monthly_income,
+            "birth_date": req.birth_date,
+            "age": age,
+        },
     }
