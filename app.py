@@ -784,7 +784,37 @@ def simulate_with_property(req: PropertySimulationRequest) -> Dict[str, Any]:
             detail=f"Nenhuma config para bank='{req.bank}' e operation='{req.operation}' (e/ou inativa).",
         )
 
+
+    # Se o request informar amortization_system, restringe às configs compatíveis
+    if req.amortization_system:
+        df2 = df[df["amortização"].astype(str).str.strip().str.upper() == req.amortization_system.strip().upper()]
+        if not df2.empty:
+            df = df2
+
+    # Se existirem múltiplas linhas para o mesmo banco/operação (ex.: modalidades/convênios),
+    # escolhemos a linha mais "exigente" para renda (maior comprometimento) e, em empate,
+    # a maior quota. Isso evita pegar uma linha mais restritiva por acidente (ex.: 15% vs 30%).
+    def _safe_num(x):
+        try:
+            v = parse_float_any(x)
+            return v if not (v != v) else float("-inf")  # NaN -> -inf
+        except Exception:
+            return float("-inf")
+
+    if len(df) > 1:
+        df = df.copy()
+        df["_commitment_num"] = df["comprometimento de renda"].apply(_safe_num)
+        df["_quota_num"] = df["quota"].apply(_safe_num)
+        # ordena: maior comprometimento, maior quota, menor taxa efetiva (como desempate opcional)
+        if "taxa efetiva (a.a.)" in df.columns:
+            df["_rate_num"] = df["taxa efetiva (a.a.)"].apply(lambda x: _safe_num(x) if _safe_num(x)!=float("-inf") else float("inf"))
+            df = df.sort_values(by=["_commitment_num", "_quota_num", "_rate_num"], ascending=[False, False, True])
+        else:
+            df = df.sort_values(by=["_commitment_num", "_quota_num"], ascending=[False, False])
+        df = df.drop(columns=[c for c in ["_commitment_num","_quota_num","_rate_num"] if c in df.columns])
+
     row = df.iloc[0]
+
 
     bank = str(row["banco"]).strip()
     operation = str(row["operação"]).strip()
@@ -889,26 +919,33 @@ def simulate_with_property(req: PropertySimulationRequest) -> Dict[str, Any]:
     # Mensagem pronta para WhatsApp (texto leigo)
     if income_sufficient_for_max_quota:
         whatsapp_message = (
-            f"✅ Simulação de financiamento ({bank} — {operation})\n"
-            f"• Valor do imóvel: {_brl(req.property_value)}\n"
-            f"• Financiamento (quota {int(quota*100)}%): {_brl(pv_main)}\n"
-            f"• Entrada: {_brl(down_payment_main)}\n"
-            f"• 1ª prestação estimada: {_brl(comps_main['installment'])}\n"
-            f"• Taxa efetiva: {_pct(rate_effective_aa)} a.a. | {_pct(rate_effective_am, 4)} a.m.\n"
-            f"\nObs.: esta é uma simulação (valores podem variar na análise do banco)."
+            f"📊 Simulação de financiamento — {bank} ({operation})\n\n"
+            f"🏠 Valor do imóvel: {_brl(req.property_value)}\n"
+            f"💰 Financiamento no limite permitido ({int(quota*100)}%):\n"
+            f"• Valor financiado: {_brl(pv_main)}\n"
+            f"• Entrada necessária: {_brl(down_payment_main)}\n"
+            f"• Primeira prestação: {_brl(comps_main['installment'])}\n\n"
+            f"✅ Com a sua renda atual, esse cenário é compatível com o comprometimento máximo permitido ({_pct(commitment)}).\n\n"
+            f"ℹ️ Importante: esta é uma simulação inicial. Os valores finais podem variar após a análise completa do banco "
+            f"(documentação, perfil e avaliação do imóvel).\n\n"
+            f"Se quiser, posso te ajudar a comparar cenários ou ajustar valores para encontrar a melhor opção."
         )
     else:
         extra_entry = max(0.0, down_payment_fit_income - down_payment_main)
         whatsapp_message = (
-            f"⚠️ Simulação de financiamento ({bank} — {operation})\n"
-            f"• Valor do imóvel: {_brl(req.property_value)}\n"
-            f"• No limite da quota ({int(quota*100)}%): financia {_brl(pv_main)} com entrada {_brl(down_payment_main)}\n"
-            f"• 1ª prestação nesse cenário: {_brl(comps_main['installment'])}\n"
-            f"\n➡️ Sua renda atual (comprometimento {_pct(commitment)}): suporta até aprox. {_brl(pv_fit_income)} financiado\n"
-            f"• Entrada para encaixar na renda atual: {_brl(down_payment_fit_income)} ( +{_brl(extra_entry)} vs. entrada mínima )\n"
-            f"• 1ª prestação no cenário que cabe na renda: {_brl(comps_fit_income['installment'])}\n"
-            f"\n📌 Para manter o financiamento de {_brl(pv_main)}, a renda necessária seria aprox. {_brl(required_income_for_max_quota)}\n"
-            f"\nObs.: esta é uma simulação (valores podem variar na análise do banco)."
+            f"📊 Simulação de financiamento — {bank} ({operation})\n\n"
+            f"🏠 Valor do imóvel: {_brl(req.property_value)}\n"
+            f"💰 Financiamento no limite permitido ({int(quota*100)}%):\n"
+            f"• Valor financiado: {_brl(pv_main)}\n"
+            f"• Entrada necessária: {_brl(down_payment_main)}\n"
+            f"• Primeira prestação: {_brl(comps_main['installment'])}\n\n"
+            f"⚠️ Com a sua renda atual, esse cenário excede o comprometimento máximo permitido ({_pct(commitment)}).\n\n"
+            f"Opções para seguir:\n"
+            f"1) Manter o financiamento de {_brl(pv_main)} → renda necessária aprox.: {_brl(required_income_for_max_quota)}\n"
+            f"2) Encaixar na sua renda atual → financia aprox.: {_brl(pv_fit_income)}\n"
+            f"   • Entrada necessária: {_brl(down_payment_fit_income)} ( +{_brl(extra_entry)} vs. entrada mínima )\n"
+            f"   • Primeira prestação estimada: {_brl(comps_fit_income['installment'])}\n\n"
+            f"ℹ️ Importante: esta é uma simulação inicial. Os valores finais podem variar após a análise completa do banco."
         )
 
     return {
